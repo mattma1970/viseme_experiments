@@ -1,0 +1,25 @@
+{
+  "name": "phenomes",
+  "private": true,
+  "version": "0.1.0",
+  "type": "module",
+  "description": "Local, in-browser viseme (\"phenome\") generation for driving 3D character mouth movement",
+  "scripts": {
+    "dev": "vite",
+    "build": "tsc --noEmit && vite build",
+    "preview": "vite preview",
+    "check": "tsx scripts/check-core.ts",
+    "gen:samples": "tsx scripts/gen-sample.ts",
+    "check:head": "tsx scripts/check-head.ts"
+  },
+  "dependencies": {
+    "three": "^0.169.0"
+  },
+  "devDependencies": {
+    "@types/node": "^22",
+    "@types/three": "^0.169.0",
+    "tsx": "^4.19.0",
+    "typescript": "^5.5.4",
+    "vite": "^6.0.0"
+  }
+}
