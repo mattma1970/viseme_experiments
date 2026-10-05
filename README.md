@@ -13,15 +13,18 @@ Research background: [`docs/viseme-generation-research.md`](docs/viseme-generati
 |---|---|---|
 | **M0** | Scaffold (Vite + TypeScript) | ✅ done |
 | **M1** | `viseme-core` (15-viseme set, IPA mapping, envelopes, dominance blending, keyframe builder) + procedural three.js test head with 15 Oculus morph targets, driven by canned phoneme JSON; audible speech via the interim system-voice bridge (`speechSynthesis` + word-boundary clock remap) | ✅ done |
-| **M2** | HeadTTS (Kokoro-82M ONNX) in-browser TTS → real per-phoneme timings feed `viseme-core`; audio playback sync; WebGPU with WASM fallback; model fetch + local cache | ⬜ next |
+| **M2** | HeadTTS (Kokoro-82M ONNX) in-browser TTS → real per-phoneme timings feed `viseme-core`; audio playback sync; WebGPU with WASM fallback; model fetch + local cache | ✅ done (M2.1: pauses no longer animate the mouth — see HANDOVER §8.1; in-browser verification still pending) |
 | **M3** | HeadAudio-style MFCC/Gaussian viseme classifier as an `AudioWorklet` (`audio/viseme-worklet.ts`) — fallback for mic input & arbitrary audio, bootstrapped from the MIT-licensed `model-en-mixed.bin` | ⬜ |
-| **M4** | Polish: smoothing/latency measurement, TTS-vs-audio A/B demo, final character asset integration via the driver's name-remap layer, docs | ⬜ |
+| **M4** | Polish: smoothing/latency measurement, TTS-vs-audio A/B demo, final character asset integration (procedural default, Ready Player Me `julia`/`david`, and the fully-textured CC0 `mpfb` head are already selectable in the demo — see Licenses), docs | ⬜ in progress |
 
 ## Quick start
 
 ```sh
 npm install
 npm run dev          # http://localhost:5173 — test head + canned tracks
+                    # head selector in the UI: procedural (default), julia,
+                    # david, mpfb (fully textured, CC0 — best for judging
+                    # viseme deformation quality)
 ```
 
 > If your npm cache dir (`~/.npm`) isn't writable, use
@@ -68,6 +71,14 @@ npm run build        # typecheck + production build
     region plus an opening sticker and lip ring that track the morphs each
     frame (`mouthOffset` / `mouthScale`). Placeholder until a final
     character asset is chosen.
+  - `glb-head.ts` — realistic-head loader for the vendored GLB avatars
+    (`julia`/`david` Ready Player Me, `mpfb` CC0): `GLTFLoader` parse,
+    `MultiMeshVisemeDriver` binding (any morph mesh that names viseme
+    channels is driven; `viseme_sil` optional), camera framing from the
+    computed head-region geometry (works for head-only and full-body face
+    meshes), and load-time patching of the RPM assets' single-color
+    placeholder eye/teeth textures (generated sclera/iris/pupil + ivory
+    teeth; real textures are never touched).
 - `src/demo/speech-bridge.ts` — interim audio: wraps the browser's system
   TTS (`speechSynthesis`) and turns its per-word boundary events into a
   piecewise-linear `TimeMap` that remaps the voice's actual pacing onto the
@@ -110,5 +121,18 @@ audio classifier (M3) reserved for mic/arbitrary audio.
 - **M3** will vendor code from **HeadAudio** (met4citizen, MIT),
   including its `model-en-mixed.bin` classifier (MIT) as the starting
   point for retraining on our own TTS-generated labels.
+- **Avatar models** — `public/avatars/` holds three vendored avatars:
+  `julia.glb` and `david.glb` are Ready Player Me avatars vendored from
+  met4citizen/HeadAudio; per met4citizen's attribution for the identical
+  models (TalkingHead) they are **CC BY-NC 4.0** (non-commercial, with
+  attribution). `mpfb.glb` (36.8 MB, fully textured) was created with
+  Blender + the MPFB extension and is **CC0** — public domain, no
+  attribution required. All three are documented in
+  `public/avatars/ATTRIBUTION.md` (SHA-256 per file, sources, licenses).
+  While the RPM pair is vendored the project is limited to non-commercial
+  use; `mpfb` alone would lift that if it ever matters. Note the RPM
+  assets ship single-color placeholder textures for eyes/teeth, which
+  `glb-head.ts` replaces procedurally at load time (the MPFB textures are
+  real and untouched).
 - GPL-licensed tools (Bournemouth Forced Aligner, VisemeNet) are **not**
   used in this codebase; see the research doc for why.

@@ -3,6 +3,7 @@
   <head>
     <meta charset="UTF-8" />
     <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+    <link rel="icon" href="data:," />
     <title>Phenomes — viseme test head (M2)</title>
     <style>
       html, body { margin: 0; height: 100%; background: #14161c; color: #e8eaf0;
@@ -28,7 +29,10 @@
       #ui .row > * { flex: 1; }
       #time { margin-top: 8px; color: #b9c1d9; font-variant-numeric: tabular-nums; }
       #bars { margin-top: 8px; width: 100%; height: 132px; background: #191c25; border-radius: 6px; }
-      #status { margin-top: 8px; color: #6f9e6f; font-size: 11px; min-height: 14px; }
+      #status { margin-top: 8px; color: #6f9e6f; font-size: 11px; min-height: 14px; white-space: pre-wrap; }
+      #overlay { position: fixed; inset: 0; display: none; align-items: center; justify-content: center; pointer-events: none; z-index: 10; }
+      #overlay .box { background: rgba(20, 23, 34, 0.94); border: 1px solid #3a415a; border-radius: 8px; padding: 14px 22px; font-size: 15px; color: #e8ecf8; white-space: pre-wrap; }
+      #overlay .box.err { border-color: #8a4040; color: #e8a0a0; font-size: 13px; max-width: 460px; }
       #wire { display: flex; align-items: center; gap: 6px; margin-top: 8px; font-size: 12px; color: #8b93a7; }
       .sndrow { display: flex; align-items: center; gap: 6px; margin-top: 8px; font-size: 12px; color: #8b93a7; }
       #voiceinfo { margin-top: 4px; font-size: 11px; color: #6d7488; }
@@ -38,6 +42,7 @@
   </head>
   <body>
     <div id="app"></div>
+    <div id="overlay"><div class="box" id="overlaybox"></div></div>
     <div id="ui">
       <h1>Phenomes · M2 test head</h1>
       <div class="sub">Kokoro-82M neural TTS (in-browser, WebGPU/WASM) → real word + viseme timings → viseme curves → Oculus morph targets. System voice stands in until the model is downloaded.</div>
@@ -47,6 +52,15 @@
         <option value="/samples/sentence-1.json">“I think the cat and you should catch…”</option>
         <option value="/samples/sentence-2.json">“Blue moon, what do you mean?”</option>
       </select>
+
+      <label>Head model</label>
+      <select id="headsel">
+        <option value="procedural" selected>Procedural test head (default)</option>
+        <option value="julia">Realistic — Julia (Ready Player Me)</option>
+        <option value="david">Realistic — David (Ready Player Me)</option>
+        <option value="mpfb">Realistic — MPFB (CC0, fully textured)</option>
+      </select>
+      <div style="font-size:11px;color:#6d7488;margin-top:3px">RPM heads are vendored from met4citizen/HeadAudio (CC BY-NC 4.0, non-commercial); mpfb is from met4citizen/TalkingHead (CC0). See public/avatars/ATTRIBUTION.md.</div>
 
       <div class="row" style="margin-top:10px">
         <button id="play">▶ Play</button>

@@ -334,7 +334,11 @@ class HeadTTS {
             if ( isTraceMessages ) {
               utils.trace( "IN: worker -> HeadTTS, message=", ev.data);
             }
-            this.processData(ev.data);
+            // phenomes patch: processData is async; a thrown rejection must
+            // not escape the event handler unobserved.
+            void this.processData(ev.data).catch( (error) => {
+              console.error("HeadTTS: processData failed, error=", error);
+            });
           }
 
           this.ww.onerror = (error) => {
@@ -977,13 +981,27 @@ class HeadTTS {
             if ( item.message.data ) {
               const itemdata = item.message.data;
               if ( itemdata.audio ) {
-                if ( typeof itemdata.audio === "string" ) {
-                  itemdata.audio = utils.b64ToArrayBuffer(itemdata.audio);
+                // phenomes patch: a decode failure (e.g. the AudioContext
+                // was closed or the payload is corrupt) must surface as an
+                // error message, not leave the item stuck at status 1 (the
+                // client promise would otherwise hang forever).
+                try {
+                  if ( typeof itemdata.audio === "string" ) {
+                    itemdata.audio = utils.b64ToArrayBuffer(itemdata.audio);
+                  }
+                  if ( itemdata.audioEncoding === "wav" ) {
+                    itemdata.audio = await this.settings.audioCtx.decodeAudioData( itemdata.audio );
+                  }
+                  item.status = 2;
+                } catch(error) {
+                  console.error("HeadTTS: Audio decode failed, error=", error);
+                  item.message = {
+                    type: "error",
+                    ref: o.ref,
+                    data: { error: "Audio decode failed: " + (error && error.message ? error.message : error) }
+                  };
+                  item.status = 2;
                 }
-                if ( itemdata.audioEncoding === "wav" ) {
-                  itemdata.audio = await this.settings.audioCtx.decodeAudioData( itemdata.audio );
-                }
-                item.status = 2;
               } else {
                 this.itemWaitingForAudio = item;
                 item.status = 1;

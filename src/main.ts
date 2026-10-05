@@ -31,14 +31,16 @@ import {
   wordAtChar,
   wordSpans,
 } from './demo/speech-bridge.js';
-import { NeuralSpeech, type TTSResult } from './tts/index.js';
+import { NeuralSpeech, withTimeout, type TTSResult } from './tts/index.js';
+import type { HeadTTSOptions } from './tts/vendor/headtts.mjs';
 import {
   buildTestHead,
   mouthOffset,
   mouthScale,
   type TestHead,
 } from './renderer/test-head.js';
-import { VisemeDriver } from './renderer/viseme-driver.js';
+import { VisemeDriver, type VisemeSink } from './renderer/viseme-driver.js';
+import type { GlbHead } from './renderer/glb-head.js';
 import { makeChannelBars, type BarCanvas } from './renderer/bars.js';
 
 // ------------------------------------------------------------------
@@ -48,6 +50,7 @@ const container = document.getElementById('app') as HTMLDivElement;
 const statusEl = document.getElementById('status') as HTMLDivElement;
 const timeEl = document.getElementById('time') as HTMLDivElement;
 const sampleSel = document.getElementById('sample') as HTMLSelectElement;
+const headSel = document.getElementById('headsel') as HTMLSelectElement;
 const wireChk = document.getElementById('wireframe') as HTMLInputElement;
 const soundChk = document.getElementById('sound') as HTMLInputElement;
 const playBtn = document.getElementById('play') as HTMLButtonElement;
@@ -88,7 +91,8 @@ scene.add(key);
 // ------------------------------------------------------------------
 const head: TestHead = buildTestHead();
 scene.add(head.group);
-const driver = new VisemeDriver(head.headMesh);
+const proceduralDriver = new VisemeDriver(head.headMesh);
+let driver: VisemeSink = proceduralDriver;
 
 // The mouth opening (dark disc) and lip ring are separate stickers that
 // must follow the morphed surface; buildTestHead leaves them at rest pose,
@@ -160,11 +164,30 @@ let words: {
 let neuralActive = false; // true while the neural buffer drives the clock
 let playBusy = false;
 let playSeq = 0; // invalidates in-flight neural plays on pause/stop
+// Hard cap on the whole neural play path (safety net over NeuralSpeech's
+// own synthesis timeout): nothing may wedge playBusy, or every later
+// play click would be silently ignored (the "second play is silent" bug).
+const PLAY_STALL_TIMEOUT_MS = 180_000;
 let neuralPct = -1; // -1 = no progress reported yet
 
 const fmt = (ms: number): string => `${(ms / 1000).toFixed(1).padStart(5, ' ')}s`;
-const status = (s: string): void => {
+const status = (s: string, err = false): void => {
   statusEl.textContent = s;
+  statusEl.style.color = err ? '#d98a8a' : '';
+};
+
+// Big center-screen indicator for head loads (the status line is easy to miss).
+const overlayEl = document.getElementById('overlay') as HTMLDivElement;
+const overlayBox = document.getElementById('overlaybox') as HTMLDivElement;
+const overlay = (s: string | null, err = false): void => {
+  if (s === null) {
+    overlayEl.style.display = 'none';
+    overlayBox.classList.remove('err');
+    return;
+  }
+  overlayBox.textContent = s;
+  overlayBox.classList.toggle('err', err);
+  overlayEl.style.display = 'flex';
 };
 function updateTime(): void {
   timeEl.textContent = track
@@ -175,7 +198,21 @@ function updateTime(): void {
 // ------------------------------------------------------------------
 // voice: M2 neural (Kokoro/HeadTTS) with the M1 system-voice fallback
 // ------------------------------------------------------------------
-const neural = new NeuralSpeech();
+// Dev/test hook: ?tts-worker=<url>[&tts-timeout=<ms>] swaps in a fake TTS
+// worker and shortens the synthesis timeout, so the failure → system-voice
+// fallback path can be exercised without the ~300 MB model download
+// (used by the headless smoke test; see HANDOVER.md).
+function ttsTestOptions(): Partial<HeadTTSOptions> & { synthTimeoutMs?: number } {
+  const p = new URLSearchParams(location.search);
+  if (!p.has('tts-worker')) return {};
+  const o: Partial<HeadTTSOptions> & { synthTimeoutMs?: number } = {};
+  const w = p.get('tts-worker');
+  if (w) o.workerModule = w;
+  const t = Number(p.get('tts-timeout'));
+  if (Number.isFinite(t) && t > 0) o.synthTimeoutMs = t;
+  return o;
+}
+const neural = new NeuralSpeech(ttsTestOptions());
 const speech = new SystemSpeech();
 let speechRunning = false;
 
@@ -261,7 +298,9 @@ function startSpeechFrom(fromMs: number): void {
  * simply restarted at the resume word, so track and audio stay in
  * perfect sync by construction.
  */
-async function playNeural(mySeq: number): Promise<void> {
+async function playNeural(
+  mySeq: number,
+): Promise<'ok' | 'cancelled' | 'failed'> {
   const text = sampleText;
   const wi = words
     ? words.wordStartMs.reduce((acc, s, i) => (s <= pausedAt ? i : acc), 0)
@@ -273,15 +312,15 @@ async function playNeural(mySeq: number): Promise<void> {
     result = await neural.speak(text, wi);
   } catch (e) {
     if (mySeq === playSeq) {
-      status(`TTS error: ${e instanceof Error ? e.message : String(e)}`);
+      status(`TTS error: ${e instanceof Error ? e.message : String(e)}`, true);
       playing = false;
       neuralActive = false;
     }
-    return;
+    return mySeq === playSeq ? 'failed' : 'cancelled';
   }
   if (mySeq !== playSeq || !result) {
     neural.stop(); // paused/stopped while synthesizing
-    return;
+    return 'cancelled';
   }
 
   // the model's own timings become the track (same seam as the JSON).
@@ -310,6 +349,7 @@ async function playNeural(mySeq: number): Promise<void> {
   neuralActive = true;
   playing = true;
   status(`speaking (Kokoro ${neural.engine}) — ${fmt(result.durationMs)}`);
+  return 'ok';
 }
 
 /** char offset of each word in `text` (best effort, case-insensitive). */
@@ -365,20 +405,55 @@ async function play(): Promise<void> {
     // M2: neural TTS. Synthesis takes a few seconds; playBusy blocks
     // re-entry while it runs, pause/stop invalidate it via playSeq.
     neuralActive = false;
-    await playNeural(mySeq);
+    let outcome: 'ok' | 'cancelled' | 'failed';
+    try {
+      outcome = await withTimeout(
+        playNeural(mySeq),
+        PLAY_STALL_TIMEOUT_MS,
+        'TTS playback stalled',
+      );
+    } catch (e) {
+      outcome = 'failed';
+      if (mySeq === playSeq) {
+        playing = false;
+        neuralActive = false;
+        status(
+          `TTS error: ${e instanceof Error ? e.message : String(e)}`,
+          true,
+        );
+      }
+    }
     playBusy = false;
+    if (outcome === 'failed' && mySeq === playSeq && track && speech.available) {
+      // Neural TTS failed: don't sit silent — speak the same sample with
+      // the system voice on the canned track. NeuralSpeech spins up a
+      // fresh worker in the background; later plays go neural again.
+      playing = true;
+      startSpeechFrom(pausedAt);
+      status(
+        speechRunning
+          ? 'neural TTS failed — using system voice'
+          : 'TTS failed and the system voice could not speak',
+        true,
+      );
+    }
   } else {
     // M1 fallback: system voice on the canned track (TimeMap remaps its
     // boundary events onto the track clock). Kick off the model download
-    // if this is the first play — next play will be neural.
-    if (neural.state === 'idle') void neural.load();
+    // if this is the first play — next play will be neural. An 'error'
+    // state also lands here (load() enforces its own retry backoff).
+    if (neural.state === 'idle' || neural.state === 'error') {
+      void neural.load();
+    }
     playing = true;
     startSpeechFrom(pausedAt);
     status(
       speechRunning
         ? neural.state === 'loading'
           ? 'speaking (system voice — Kokoro downloading…)'
-          : 'speaking (system voice)'
+          : neural.state === 'error'
+            ? 'speaking (system voice — Kokoro recovering…)'
+            : 'speaking (system voice)'
         : 'speaking (no TTS — wall-clock pacing)',
     );
     playBusy = false;
@@ -459,6 +534,109 @@ async function loadSample(): Promise<void> {
 }
 
 // ------------------------------------------------------------------
+// head model: procedural placeholder vs. realistic GLB avatar
+// ------------------------------------------------------------------
+type HeadId = 'procedural' | 'julia' | 'david' | 'mpfb';
+const HEAD_URLS: Record<Exclude<HeadId, 'procedural'>, string> = {
+  julia: 'avatars/julia.glb',
+  david: 'avatars/david.glb',
+  mpfb: 'avatars/mpfb.glb',
+};
+let activeHead: HeadId = 'procedural';
+const glbCache = new Map<HeadId, GlbHead>();
+let glbFrame: ((
+  group: THREE.Group,
+  camera: THREE.PerspectiveCamera,
+  controls: OrbitControls,
+) => void) | null = null;
+let savedCam: { pos: THREE.Vector3; target: THREE.Vector3 } | null = null;
+
+async function switchHead(id: HeadId): Promise<void> {
+  if (id === activeHead) return;
+
+  let glb: GlbHead | undefined;
+  if (id !== 'procedural') {
+    glb = glbCache.get(id);
+    if (!glb) {
+      overlay(`Loading ${id} head…`);
+      try {
+        // lazy: GLTFLoader (~70 kB) is only needed for the realistic heads
+        const { frameCameraOnHead: frame, loadGlbHead } = await import('./renderer/glb-head.js');
+        glb = await loadGlbHead(
+          new URL(HEAD_URLS[id], document.baseURI).href,
+          id,
+          (pct) => {
+            overlayBox.textContent = `Loading ${id} head… ${pct}%`;
+            status(`loading ${id} head… ${pct}%`);
+          },
+        );
+        glbFrame = frame;
+      } catch (e) {
+        overlay(
+          `Could not load the “${id}” head — check the browser console:\n${e instanceof Error ? e.message : String(e)}`,
+          true,
+        );
+        status(`head load failed: ${e instanceof Error ? e.message : String(e)}`, true);
+        headSel.value = activeHead;
+        return;
+      }
+      glbCache.set(id, glb);
+    }
+  }
+
+  if (activeHead === 'procedural') {
+    savedCam = {
+      pos: camera.position.clone(),
+      target: controls.target.clone(),
+    };
+    head.group.visible = false;
+  } else {
+    const prev = glbCache.get(activeHead);
+    if (prev) {
+      scene.remove(prev.group);
+      if (!wireChk.checked) {
+        prev.headMaterials.forEach(
+          (m) => ((m as THREE.MeshStandardMaterial).wireframe = false),
+        );
+      }
+    }
+  }
+
+  if (id === 'procedural') {
+    head.group.visible = true;
+    if (savedCam) {
+      camera.position.copy(savedCam.pos);
+      controls.target.copy(savedCam.target);
+    }
+    controls.update();
+    (head.headMesh.material as THREE.MeshStandardMaterial).wireframe =
+      wireChk.checked;
+  } else if (glb) {
+    scene.add(glb.group);
+    if (glbFrame) glbFrame(glb.group, camera, controls);
+    glb.headMaterials.forEach(
+      (m) => ((m as THREE.MeshStandardMaterial).wireframe = wireChk.checked),
+    );
+  }
+
+  driver = id === 'procedural' ? proceduralDriver : glb!.sink;
+  if (track) {
+    driver.loadTrack(track);
+    if (playing) driver.updateTrack(elapsedMs);
+  }
+
+  activeHead = id;
+  overlay(null);
+  status(
+    id === 'procedural'
+      ? 'procedural test head'
+      : `${id} head — ${glb!.sink.boundCount}/15 channels on ${glb!.sink.drivers.length} morph meshes (CC BY-NC)`,
+  );
+}
+
+headSel.addEventListener('change', () => void switchHead(headSel.value as HeadId));
+
+// ------------------------------------------------------------------
 // UI
 // ------------------------------------------------------------------
 playBtn.addEventListener('click', () => {
@@ -470,8 +648,15 @@ sampleSel.addEventListener('change', () => {
   void loadSample();
 });
 wireChk.addEventListener('change', () => {
-  (head.headMesh.material as THREE.MeshStandardMaterial).wireframe =
-    wireChk.checked;
+  if (activeHead === 'procedural') {
+    (head.headMesh.material as THREE.MeshStandardMaterial).wireframe =
+      wireChk.checked;
+  } else {
+    const g = glbCache.get(activeHead);
+    g?.headMaterials.forEach(
+      (m) => ((m as THREE.MeshStandardMaterial).wireframe = wireChk.checked),
+    );
+  }
 });
 // the engine is chosen at play-time; toggling sound just re-arms it
 
@@ -511,7 +696,7 @@ function tick(): void {
   }
 
   driver.readAll(scratch);
-  updateMouthStickers(scratch);
+  if (activeHead === 'procedural') updateMouthStickers(scratch);
   bars.draw(scratch);
   // dominant-viseme readout (updated only when the winner changes)
   let best = 0;

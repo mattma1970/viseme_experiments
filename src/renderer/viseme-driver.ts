@@ -12,9 +12,15 @@
  */
 
 import type * as THREE from 'three';
-import { NUM_VISEMES, VISEMES } from '../viseme-core/visemes.js';
+import { NUM_VISEMES, VISEMES, VISeme_INDEX } from '../viseme-core/visemes.js';
+import type { VisemeId } from '../viseme-core/visemes.js';
 import type { VisemeTrack } from '../viseme-core/types.js';
 import { sampleTrack } from '../viseme-core/curves.js';
+
+function clamp01(v: number): number {
+  if (Number.isNaN(v)) return 0;
+  return v < 0 ? 0 : v > 1 ? 1 : v;
+}
 
 export interface VisemeDriverOptions {
   /** Map our channel name → the asset's morph target name (identity by default). */
@@ -41,9 +47,14 @@ export interface VisemeSink {
 
 export class VisemeDriver implements VisemeSink {
   private mesh: THREE.Mesh;
-  private map = new Map<string, number>(); // channel name → morph index
-  private values = new Float32Array(NUM_VISEMES);
-  private scratch = new Float32Array(NUM_VISEMES);
+  // channel name → morph-target index IN THIS MESH's morph array. The mesh
+  // index can be anything (0..N of the asset's morphs); our value storage is
+  // always indexed by channel (0..NUM_VISEMES-1). Mixing those two index
+  // spaces is what corrupted the MPFB head (out-of-range writes into the
+  // 15-slot values buffer → undefined → NaN uniform → invisible mesh).
+  private map = new Map<string, number>();
+  private values = new Float32Array(NUM_VISEMES); // indexed by channel
+  private scratch = new Float32Array(NUM_VISEMES); // indexed by channel
   track: VisemeTrack | null = null;
 
   constructor(mesh: THREE.Mesh, opts: VisemeDriverOptions = {}) {
@@ -72,20 +83,15 @@ export class VisemeDriver implements VisemeSink {
 
   /** Set a single channel by name (live mode). Value clamped to [0,1]. */
   setViseme(channel: string, v: number): void {
-    const i = this.map.get(channel);
-    if (i === undefined) return;
-    this.values[i] = v < 0 ? 0 : v > 1 ? 1 : v;
+    if (!(channel in VISeme_INDEX) || !this.map.has(channel)) return;
+    this.values[VISeme_INDEX[channel as VisemeId]] = clamp01(v);
     this.commit();
   }
 
   /** Set many channels at once (live mode). */
   setAll(values: ArrayLike<number>): void {
-    for (let i = 0; i < NUM_VISEMES; i++) {
-      const ch = VISEMES[i];
-      const j = this.map.get(ch);
-      if (j === undefined) continue;
-      const v = values[i] ?? 0;
-      this.values[j] = v < 0 ? 0 : v > 1 ? 1 : v;
+    for (let ci = 0; ci < NUM_VISEMES; ci++) {
+      this.values[ci] = clamp01(values[ci] ?? 0);
     }
     this.commit();
   }
@@ -94,12 +100,8 @@ export class VisemeDriver implements VisemeSink {
   updateTrack(tMs: number): void {
     if (!this.track) return;
     sampleTrack(this.track, tMs, this.scratch);
-    for (let i = 0; i < NUM_VISEMES; i++) {
-      const ch = VISEMES[i];
-      const j = this.map.get(ch);
-      if (j === undefined) continue;
-      const v = this.scratch[i];
-      this.values[j] = v < 0 ? 0 : v > 1 ? 1 : v;
+    for (let ci = 0; ci < NUM_VISEMES; ci++) {
+      this.values[ci] = clamp01(this.scratch[ci]);
     }
     this.commit();
   }
@@ -116,15 +118,15 @@ export class VisemeDriver implements VisemeSink {
 
   /** Current value of a channel (for UI meters etc.). */
   get(channel: string): number {
-    const i = this.map.get(channel);
-    return i === undefined ? 0 : this.values[i];
+    if (!(channel in VISeme_INDEX) || !this.map.has(channel)) return 0;
+    return this.values[VISeme_INDEX[channel as VisemeId]];
   }
 
   /** Copy current values into a caller-provided array of length NUM_VISEMES. */
   readAll(out: Float32Array): Float32Array {
-    for (let i = 0; i < NUM_VISEMES; i++) {
-      const j = this.map.get(VISEMES[i]);
-      out[i] = j === undefined ? 0 : this.values[j];
+    for (let ci = 0; ci < NUM_VISEMES; ci++) {
+      const ch = VISEMES[ci];
+      out[ci] = this.map.has(ch) ? this.values[ci] : 0;
     }
     return out;
   }
@@ -132,8 +134,13 @@ export class VisemeDriver implements VisemeSink {
   private commit(): void {
     const inf = this.mesh.morphTargetInfluences;
     if (!inf) return;
-    this.map.forEach((idx) => {
-      inf[idx] = this.values[idx];
+    this.map.forEach((meshIdx, ch) => {
+      const ci = VISeme_INDEX[ch as VisemeId];
+      const v = this.values[ci];
+      // Never allow a non-finite value into the influences array: a NaN
+      // influence makes `inf != 0.0` true in GLSL and NaNs out every vertex
+      // of the mesh (the mesh then renders nothing).
+      inf[meshIdx] = typeof v === 'number' && Number.isFinite(v) ? v : 0;
     });
   }
 }

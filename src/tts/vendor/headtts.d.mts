@@ -85,6 +85,12 @@ export class HeadTTS {
   onerror: ((error: unknown) => void) | null;
 
   /**
+   * The raw settings object (mutated by connect()); the AudioContext
+   * used for decoding synthesized audio lives here.
+   */
+  settings: HeadTTSOptions;
+
+  /**
    * Connect to the first supported endpoint (module worker running
    * WebGPU or WASM inference). Resolves when the model and preloaded
    * voices are ready; reports download progress via onprogress.

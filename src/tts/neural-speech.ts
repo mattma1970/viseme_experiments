@@ -15,14 +15,54 @@
  * TimeMap remap on this path.
  *
  * English only (G2P = CMU Pronouncing Dictionary, en-us).
+ *
+ * Failure policy: synthesis is capped by a timeout (default 120 s), any
+ * failure (timeout, worker error message, decode failure, dead
+ * AudioContext) puts the engine into 'error' and spins up a fresh worker
+ * in the background; the demo speaks with the system voice meanwhile
+ * and neural TTS recovers without a page reload. The vendored worker and
+ * client carry small local patches (marked "phenomes patch") so a
+ * mid-synthesis exception is reported back as an error message instead
+ * of wedging the worker's queue.
  */
 
 import type { PhonemeEvent } from '../viseme-core/types.js';
-import type { HeadTTSAudioData } from './vendor/headtts.mjs';
+import type { HeadTTSAudioData, HeadTTSMessage, HeadTTSOptions } from './vendor/headtts.mjs';
 import { HeadTTS } from './vendor/headtts.mjs';
 import { isModuleWebWorkers, isWebGPU } from './vendor/utils.mjs';
 
 export type NeuralEngine = 'webgpu' | 'wasm';
+
+/** Default: give up on a fresh synthesis after this long (ms). */
+const SYNTH_TIMEOUT_MS = 120_000;
+/** Backoff between neural-engine recovery attempts after a failure (ms). */
+const RECONNECT_AFTER_MS = 60_000;
+
+/**
+ * Reject a promise that does not settle within `ms`. A wedged TTS worker
+ * (stalled GPU inference, dropped message) must never be able to keep
+ * the demo's play loop blocked.
+ */
+export function withTimeout<T>(
+  p: Promise<T>,
+  ms: number,
+  msg: string,
+): Promise<T> {
+  let t: ReturnType<typeof setTimeout> | undefined;
+  return new Promise<T>((resolve, reject) => {
+    t = setTimeout(() => reject(new Error(msg)), ms);
+    Promise.resolve(p).then(
+      (v) => {
+        clearTimeout(t);
+        resolve(v);
+      },
+      (e) => {
+        clearTimeout(t);
+        reject(e instanceof Error ? e : new Error(String(e)));
+      },
+    );
+  });
+}
 export type NeuralState =
   | 'unsupported' // no module workers in this browser
   | 'idle' // not yet connected (model not downloaded)
@@ -52,8 +92,12 @@ export interface TTSResult {
 }
 
 export class NeuralSpeech {
-  /** Shared audio clock (the demo's tick() reads it for the neural path). */
-  readonly audioCtx: AudioContext;
+  /**
+   * Shared audio clock (the demo's tick() reads it for the neural path).
+   * Re-created if the context ever ends up 'closed' — a BufferSource on
+   * a dead context plays silence.
+   */
+  private audioCtx: AudioContext;
   /** Inference backend chosen at construction, or null if unsupported. */
   readonly engine: NeuralEngine | null;
 
@@ -79,8 +123,15 @@ export class NeuralSpeech {
   private stopped = true; // guards the spurious onended fired by stop()
   private lastResult: TTSResult | null = null;
   private lastText = '';
+  private lastErrorAt = 0;
+  private synthTimeoutMs = SYNTH_TIMEOUT_MS;
+  private stopCalled = false; // stop() since speak() started (not a failure)
 
-  constructor() {
+  constructor(extra: Partial<HeadTTSOptions> & { synthTimeoutMs?: number } = {}) {
+    const { synthTimeoutMs: timeoutOverride, ...headtts } = extra;
+    if (timeoutOverride !== undefined) {
+      this.synthTimeoutMs = timeoutOverride;
+    }
     this.audioCtx = new AudioContext();
     if (!isModuleWebWorkers()) {
       this.engine = null;
@@ -98,6 +149,7 @@ export class NeuralSpeech {
         // Absolute URL: the worker resolves relative fetches against its
         // own script URL, not the page (see vendored worker-tts.mjs).
         dictionaryURL: new URL('tts/dictionaries/', document.baseURI).href,
+        ...headtts, // test/dev overrides (e.g. workerModule)
       },
       (err) => this.setState('error', errorMessage(err)),
     );
@@ -106,11 +158,16 @@ export class NeuralSpeech {
   /**
    * Connect: spins up the worker, downloads the model (progress via
    * onProgress), preloads the voice. Idempotent — safe to call from any
-   * user gesture. Resolves once synthesis is ready.
+   * user gesture. After a failure the engine backs off for a while, then
+   * retries (a failed worker is replaced wholesale by reconnectWorker()).
+   * Resolves once synthesis is ready.
    */
   async load(): Promise<void> {
-    if (!this.tts || this.state === 'unsupported' || this.state === 'error') {
-      return;
+    if (!this.tts || this.state === 'unsupported') return;
+    if (this.state === 'error') {
+      // Back off after a failure; the demo keeps using the system voice
+      // meanwhile and calls load() again on each play click.
+      if (performance.now() - this.lastErrorAt < RECONNECT_AFTER_MS) return;
     }
     if (this.state === 'loading' || this.state === 'ready') return;
     this.setState('loading');
@@ -121,9 +178,7 @@ export class NeuralSpeech {
           ev.lengthComputable ? ev.total ?? 0 : 0,
         );
       });
-      if (this.audioCtx.state === 'suspended') {
-        await this.audioCtx.resume();
-      }
+      await this.ensureAudioRunning();
       this.setState('ready');
     } catch (err) {
       this.setState('error', errorMessage(err));
@@ -139,30 +194,59 @@ export class NeuralSpeech {
    */
   async speak(text: string, fromWord = 0): Promise<TTSResult | null> {
     if (this.state !== 'ready' || !this.tts) return null;
-    if (this.audioCtx.state === 'suspended') {
-      await this.audioCtx.resume();
-    }
+    this.stopCalled = false;
+    // A suspended/closed context plays silence — verify it is running
+    // before scheduling audio (throws so the caller can fall back).
+    await this.ensureAudioRunning();
 
     let result: TTSResult;
     if (this.lastResult && this.lastText === text) {
       result = this.lastResult;
     } else {
-      // The worker applies no defaults in non-REST mode, so pass all of
-      // them explicitly ("undefined.bin" otherwise — see worker-tts.mjs).
-      const messages = await this.tts.synthesize({
-        input: text,
-        voice: 'af_bella',
-        language: 'en-us',
-        audioEncoding: 'wav',
-      });
-      const parts: TTSResult[] = [];
+      let messages: HeadTTSMessage[];
+      try {
+        // The worker can hang (wedged inference session, GPU stall) —
+        // cap the wait so one bad synthesis cannot block the demo.
+        messages = await withTimeout(
+          this.tts.synthesize({
+            input: text,
+            voice: 'af_bella',
+            language: 'en-us',
+            audioEncoding: 'wav',
+          }),
+          this.synthTimeoutMs,
+          `TTS synthesis timed out after ${Math.round(
+            this.synthTimeoutMs / 1000,
+          )}s`,
+        );
+      } catch (e) {
+        this.failSynthesis(e);
+        throw e instanceof Error ? e : new Error(String(e));
+      }
+      // The worker reports a failure as a resolved "error" message
+      // (inference exception, decode failure, ...). Same recovery path —
+      // unless the user paused/stopped mid-synthesis, which cancels the
+      // request rather than failing it.
       for (const m of messages) {
         if (m.type === 'error' || !m.data) {
-          throw new Error(m.data?.error ?? 'TTS synthesis failed');
+          if (this.stopCalled) return null;
+          const err = new Error(m.data?.error ?? 'TTS synthesis failed');
+          this.failSynthesis(err);
+          throw err;
         }
-        parts.push(toResult(m.data));
       }
-      if (parts.length === 0) throw new Error('TTS produced no audio');
+      let parts: TTSResult[];
+      try {
+        parts = messages.map((m) => toResult(m.data!));
+      } catch (e) {
+        this.failSynthesis(e);
+        throw e instanceof Error ? e : new Error(String(e));
+      }
+      if (parts.length === 0) {
+        const err = new Error('TTS produced no audio');
+        this.failSynthesis(err);
+        throw err;
+      }
       result = mergeParts(parts);
       this.lastResult = result;
       this.lastText = text;
@@ -190,6 +274,7 @@ export class NeuralSpeech {
    * onended this causes is suppressed.
    */
   stop(): void {
+    this.stopCalled = true;
     this.stopSource();
     this.tts?.clear();
   }
@@ -202,6 +287,66 @@ export class NeuralSpeech {
         (this.audioCtx.currentTime - this.startCtxTime)) *
       1000;
     return Math.max(0, Math.min(ms, this.lastResult.durationMs));
+  }
+
+  /**
+   * Make sure the shared AudioContext can actually play: browsers start
+   * it 'suspended' until a user gesture and it can end up 'closed' — in
+   * either case a started BufferSource would be silent. Throws when it
+   * cannot be made running, so the caller falls back to the system voice.
+   */
+  private async ensureAudioRunning(): Promise<void> {
+    let ctx = this.audioCtx;
+    if (ctx.state === 'closed') {
+      ctx = new AudioContext();
+      this.audioCtx = ctx;
+      // HeadTTS decodes the synthesized WAV through this same context.
+      if (this.tts && this.tts.settings.audioCtx !== ctx) {
+        this.tts.settings.audioCtx = ctx;
+      }
+    }
+    if (ctx.state === 'suspended') {
+      await ctx.resume().catch(() => {});
+    }
+    if (ctx.state !== 'running') {
+      throw new Error(`audio output unavailable (AudioContext ${ctx.state})`);
+    }
+  }
+
+  /**
+   * Recover from a failed or wedged synthesis: mark the engine failed
+   * (the demo falls back to the system voice for subsequent plays) and
+   * spin up a fresh worker in the background, so neural TTS comes back
+   * on its own without a page reload.
+   */
+  private failSynthesis(e: unknown): void {
+    this.lastErrorAt = performance.now();
+    // Drop anything still queued client-side before the worker dies.
+    this.tts?.clear();
+    this.setState('error', errorMessage(e));
+    void this.reconnectWorker();
+  }
+
+  /**
+   * Force a fresh worker and restore the 'ready' state. HeadTTS's
+   * connect(null) is a no-op while it believes it is connected, so pass
+   * an (empty) settings object to force a full disconnect/reconnect.
+   */
+  private async reconnectWorker(): Promise<void> {
+    if (!this.tts || this.state === 'unsupported') return;
+    this.setState('loading');
+    try {
+      await this.tts.connect({}, (ev) => {
+        this.onProgress(
+          ev.loaded ?? 0,
+          ev.lengthComputable ? ev.total ?? 0 : 0,
+        );
+      });
+      await this.ensureAudioRunning();
+      this.setState('ready');
+    } catch (err) {
+      this.setState('error', errorMessage(err));
+    }
   }
 
   private stopSource(): void {
@@ -221,6 +366,7 @@ export class NeuralSpeech {
   private setState(state: NeuralState, detail?: string): void {
     if (this.state === state) return;
     this.state = state;
+    if (state === 'error') this.lastErrorAt = performance.now();
     this.onState(state, detail);
   }
 }

@@ -1,5 +1,12 @@
 import * as utils from "./utils.mjs";
 
+// phenomes local patch (upstream: met4citizen/HeadTTS v1.3.0, MIT):
+//  - process() wraps each queue item in try/catch and resets isProcessing
+//    in a finally block. Upstream lets any exception (G2P, tokenizer,
+//    ONNX inference, audio encode) escape the loop: isProcessing stays
+//    true forever and every later synthesize request is silently dropped
+//    without any message reaching the client.
+
 // Dynamic imports
 let StyleTextToSpeech2Model;
 let AutoTokenizer;
@@ -311,10 +318,12 @@ function updateTimestamps(o,ds,silences) {
 async function process() {
   if ( isProcessing || !isReady ) return;
   isProcessing = true;
+  try {
   while( queue.length ) {
     const item = queue[0];
     queue.shift();
     const d = item.data;
+    try {
 
     // Generate tokens/phonemes and initialize TalkingHead audio object
     let language;
@@ -396,8 +405,18 @@ async function process() {
     item.type = "audio";
     item.data = metadata;
     eventHandler.postMessage(item, [metadata.audio]);
-
+    } catch(error) {
+      // phenomes patch: report the failure and keep the queue alive.
+      console.error("HeadTTS Worker: Synthesis failed, error=", error, " item=", item);
+      item.ref = item.id;
+      delete item.id;
+      item.type = "error";
+      item.data = { error: String(error && error.message ? error.message : error) };
+      eventHandler.postMessage(item);
+    }
   }
-  isProcessing = false;
+  } finally {
+    isProcessing = false;
+  }
 
 }
